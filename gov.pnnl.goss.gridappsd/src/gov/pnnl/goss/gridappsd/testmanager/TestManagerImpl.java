@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright � 2017, Battelle Memorial Institute All rights reserved.
+ * Copyright (c) 2017, Battelle Memorial Institute All rights reserved.
  * Battelle Memorial Institute (hereinafter Battelle) hereby grants permission to any person or entity 
  * lawfully obtaining a copy of this software and associated documentation files (hereinafter the 
  * Software) to redistribute and use the Software in source and binary forms, with or without modification. 
@@ -11,7 +11,7 @@
  * the following disclaimer in the documentation and/or other materials provided with the distribution.
  * Other than as used herein, neither the name Battelle Memorial Institute or Battelle may be used in any 
  * form whatsoever without the express written consent of Battelle.
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS �AS IS� AND ANY 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY 
  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF 
  * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL 
  * BATTELLE OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, 
@@ -39,47 +39,49 @@
  ******************************************************************************/
 package gov.pnnl.goss.gridappsd.testmanager;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.Serializable;
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import gov.pnnl.goss.gridappsd.api.DataManager;
+import gov.pnnl.goss.gridappsd.api.LogManager;
+import gov.pnnl.goss.gridappsd.api.TestManager;
+import gov.pnnl.goss.gridappsd.dto.RequestTestUpdate;
+import gov.pnnl.goss.gridappsd.dto.RequestTestUpdate.RequestType;
+import gov.pnnl.goss.gridappsd.dto.RuleSettings;
+import gov.pnnl.goss.gridappsd.dto.SimulationContext;
+import gov.pnnl.goss.gridappsd.dto.TestConfig;
+import gov.pnnl.goss.gridappsd.dto.events.Event;
+import gov.pnnl.goss.gridappsd.utils.GridAppsDConstants;
 
-import javax.jms.JMSException;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.felix.dm.annotation.api.Component;
 import org.apache.felix.dm.annotation.api.ServiceDependency;
 import org.apache.felix.dm.annotation.api.Start;
 import org.apache.http.auth.Credentials;
 import org.apache.http.auth.UsernamePasswordCredentials;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.protocol.HTTP;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.stream.JsonReader;
-
-import gov.pnnl.goss.gridappsd.api.ConfigurationManager;
-import gov.pnnl.goss.gridappsd.api.LogManager;
-import gov.pnnl.goss.gridappsd.api.ProcessManager;
-import gov.pnnl.goss.gridappsd.api.SimulationManager;
-import gov.pnnl.goss.gridappsd.api.TestManager;
-import gov.pnnl.goss.gridappsd.dto.LogMessage;
-import gov.pnnl.goss.gridappsd.dto.LogMessage.LogLevel;
-import gov.pnnl.goss.gridappsd.dto.LogMessage.ProcessStatus;
-import gov.pnnl.goss.gridappsd.dto.PowerSystemConfig;
-import gov.pnnl.goss.gridappsd.dto.RequestSimulation;
-import gov.pnnl.goss.gridappsd.dto.RequestTest;
-import gov.pnnl.goss.gridappsd.dto.SimulationConfig;
-import gov.pnnl.goss.gridappsd.dto.TestConfiguration;
-import gov.pnnl.goss.gridappsd.dto.TestScript;
-import gov.pnnl.goss.gridappsd.utils.GridAppsDConstants;
 import pnnl.goss.core.Client;
 import pnnl.goss.core.Client.PROTOCOL;
 import pnnl.goss.core.ClientFactory;
 import pnnl.goss.core.DataResponse;
 import pnnl.goss.core.GossResponseEvent;
-import pnnl.goss.core.Request.RESPONSE_FORMAT;
+
+import com.google.gson.JsonObject;
 
 
 
@@ -92,286 +94,299 @@ import pnnl.goss.core.Request.RESPONSE_FORMAT;
 public class TestManagerImpl implements TestManager {
 	
 
-	public static final String topic_requestTest = "goss.gridappsd" +".test";
-	
-	private static Logger log = LoggerFactory.getLogger(TestManagerImpl.class);
-	
 	@ServiceDependency
 	private volatile ClientFactory clientFactory;
 	
 	@ServiceDependency
-	private volatile SimulationManager simulationManager;
-	
-	@ServiceDependency
-	private volatile ConfigurationManager configurationManager;
-	
-	@ServiceDependency
-	private volatile ProcessManager processManager;
-	
-	
-	@ServiceDependency
 	private volatile LogManager logManager;
+
+	@ServiceDependency
+	private volatile DataManager dataManger;
 	
-	public TestManagerImpl(){}
-	public TestManagerImpl(ClientFactory clientFactory, 
-			ConfigurationManager configurationManager,
-			SimulationManager simulationManager,
-			LogManager logManager){
-		this.clientFactory = clientFactory;
-		this.configurationManager = configurationManager;
-		this.simulationManager = simulationManager;
-		this.logManager = logManager;
+	private Hashtable<String, AtomicInteger> rulePorts = new Hashtable<String, AtomicInteger>();
+	
+	private Random randPort = new Random();
+	
+	private enum EventStatus {
+	    SCHEDULED, INITIATED, CLEARED, CANCELLED
 	}
 	
+	private Map<String,List<Event>> TestContext = new HashMap<String, List<Event>>();
+	private Map<String,EventStatus> EventStatus = new HashMap<String, EventStatus>();
+	private HashMap<String, ProcessEvents> processEventsMap = new HashMap<String, ProcessEvents>(10);
+	
+
+	Client client;
+	
+	String testOutputTopic = GridAppsDConstants.topic_simulationTestOutput;
+
+	public TestManagerImpl(){}
+	public TestManagerImpl(ClientFactory clientFactory, 
+			LogManager logManager,
+			DataManager dataManager){
+		this.clientFactory = clientFactory;
+		this.logManager = logManager;
+		this.dataManger = dataManager;
+	}
+
+	
 	@Start
-	public void start(){
-		
-		try{
-			LogMessage logMessageObj = createLogMessage();
-			
-			logMessageObj.setLogMessage("Starting "+this.getClass().getName());
-			logManager.log(logMessageObj,GridAppsDConstants.username, null);
-			
+	public void start() {
+
+		try {
+
+			// Log - "Starting "+this.getClass().getName());
 			Credentials credentials = new UsernamePasswordCredentials(
 					GridAppsDConstants.username, GridAppsDConstants.password);
-			Client client = clientFactory.create(PROTOCOL.STOMP,credentials);
+			client = clientFactory.create(PROTOCOL.STOMP, credentials);
 			
-//			String path = "/Users/jsimpson/git/adms/GOSS-GridAPPS-D/gov.pnnl.goss.gridappsd/applications/python/exampleTestConfig.json";
-//			TestConfiguration testConf = loadTestConfig(path);
-//			path = "/Users/jsimpson/git/adms/GOSS-GridAPPS-D/gov.pnnl.goss.gridappsd/applications/python/exampleTestScript.json";
-//			TestScript testScript = loadTestScript(path);
-//			
-//			requestSimulation(client, testConf, testScript);
-			
-//			TestConfigurationImpl tc = null;
-//			
-//			TestScriptImpl ts = null;
-//			
-			//TODO: Setup Figure out location of TestScripts
-			
-//			requestSimulation(client, tc, ts);
-			
-			//TODO: Collect data from data manager
-				// TODO Build queries
-			
-			//TODO: Get Simulation Results from ProcessManager
-			
-			//TODO: Compare Results
-			
-			//TODO: 
-			
-			// Is called directly from process manager Remove on message
-			
-			//TODO: subscribe to GridAppsDConstants.topic_request_prefix+/* instead of GridAppsDConstants.topic_requestSimulation
-			client.subscribe(topic_requestTest, new GossResponseEvent() {
+			client.subscribe(GridAppsDConstants.topic_simulationTestInput+".>", new GossResponseEvent() {
 				
 				@Override
 				public void onMessage(Serializable message) {
-					DataResponse event = (DataResponse)message;
-					logMessageObj.setTimestamp(new Date().getTime());
-					logMessageObj.setLogMessage("Recevied message: "+ event.getData() +" on topic "+event.getDestination());
-					logManager.log(logMessageObj,GridAppsDConstants.username,null);
 					
-					RequestTest reqTest = RequestTest.parse(message.toString());
-					
-					TestConfiguration testConfig = loadTestConfig(reqTest.getTestConfigPath());
-					
-					TestScript testScript = loadTestScript(reqTest.getTestScriptPath());
-					
-					try {
-						requestSimulation(client, testConfig, testScript);
-					} catch (JMSException e) {
-						// TODO Auto-generated catch block
-						e.printStackTrace();
+					DataResponse request;
+					if (message instanceof DataResponse){
+						request = (DataResponse)message;
+						String topic = request.getDestination();
+						String simulationId = topic.substring(topic.lastIndexOf("."), topic.length());
+						
+						if(request.getData() instanceof RequestTestUpdate){
+							
+							RequestTestUpdate requestTestUpdate = RequestTestUpdate.parse(request.getData().toString());
+							
+							if(requestTestUpdate.getCommand() == RequestType.new_events){
+								sendEventsToSimulation(requestTestUpdate.getEvents(), simulationId);
+							}
+							else if(requestTestUpdate.getCommand() == RequestType.update_events){
+								updateEventForSimulation(requestTestUpdate.getEvents(), simulationId);
+							}
+							else if(requestTestUpdate.getCommand() == RequestType.query_events){
+								sendEventStatus(simulationId, request.getDestination());
+							}
+						}
 					}
-					
 				}
-
 			});
+
+		} catch (Exception e) {
+			//TODO-log.error("Error in test manager", e);
 		}
-		catch(Exception e){
-			log.error("Error in process manager",e);
-		}	
 	}
 	
-	private LogMessage createLogMessage() {
-		LogMessage logMessageObj = new LogMessage();
-		logMessageObj.setSource(this.getClass().getSimpleName());
-		logMessageObj.setLogLevel(LogLevel.DEBUG);
-		logMessageObj.setSource(this.getClass().getSimpleName());
-		logMessageObj.setProcessStatus(ProcessStatus.RUNNING);
-		logMessageObj.setStoreToDb(true);
-		logMessageObj.setTimestamp(new Date().getTime());
-		return logMessageObj;
+	public void handleTestRequest(TestConfig testConfig, SimulationContext simulationContext) {
+		
+		//Not testing this simulation
+		if(testConfig == null){
+			return;
+		}
+		String simulationId = simulationContext.getSimulationId();
+		String simulationDir = simulationContext.getSimulationDir();
+
+		if (testConfig.getEvents() != null && testConfig.getEvents().size() > 0) {
+			sendEventsToSimulation(testConfig.getEvents(), simulationId);
+		}
+
+		if (testConfig.getCompareWithSimId() != null) {
+			compareSimulations(simulationId, testConfig.getCompareWithSimId());
+		}
+		
+		if(testConfig.getExpectedResultObject() != null){
+			compareWithExpectedSimOutput(simulationId, testConfig.getExpectedResultObject());
+		}
+
+		if (testConfig.getRules() != null && testConfig.getRules().size() > 0) {
+			comapareSimOutputWithAppRules(simulationId, simulationDir, testConfig.getAppId(), testConfig.getRules());
+		}
+
 	}
 	
+	@Override
+	public void sendEventsToSimulation(List<Event> events, String simulationId){
+		//TODO: Add simulation and events in TestContext Map variable 
+		//TODO : Update events status in EventStatus Map variable 
+//		ProcessEvents pe = new ProcessEvents(logManager, events);
+//		pe.processEvents(client, simulationId);
+//		EventCommand eventCommand = EventCommand.parse(dataStr);	
+		ProcessEvents pe = getProcessEvents(client, simulationId);
+		pe.addEvents(events);
+		
+//		if(eventCommand.command.equalsIgnoreCase("CommEvent")){
+//			pe.addEventCommandMessage(eventCommand);
+//		}	
+	}
 	
-	public TestConfiguration loadTestConfig(String path){
-		LogMessage logMessageObj = createLogMessage();
-		logMessageObj.setLogMessage("Loading TestCofiguration from:" + path);
-		logManager.log(logMessageObj,GridAppsDConstants.username,null);
-//		path = "/Users/jsimpson/git/adms/GOSS-GridAPPS-D/gov.pnnl.goss.gridappsd/applications/python/exampleTestConfig2.json";
-//		Gson  gson = new Gson().setDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").create();
-		Gson gson = new GsonBuilder().setDateFormat("yyyy-MM-dd HH:mm:ss").create();
-		JsonReader jsonReader;
-		TestConfiguration testConfig = null;
-		try {
-			jsonReader = new JsonReader(new FileReader(path));
-			jsonReader.setLenient(true);
-			testConfig = gson.fromJson(new FileReader(path),TestConfiguration.class);
-			System.out.println(testConfig.toString());
+	private ProcessEvents getProcessEvents(Client client, String simulationId) {
+		ProcessEvents pe;
+		if(! processEventsMap.containsKey(simulationId) ){
+			pe = processEventsMap.getOrDefault(simulationId, new ProcessEvents(logManager, client, simulationId));
+			processEventsMap.putIfAbsent(simulationId, pe);
+	    }
+		pe = processEventsMap.get(simulationId);
+		return pe;
+	}
+	
+	@Override
+	public void updateEventForSimulation(List<Event> events, String simulationId){
+		//TODO : Check and Update events status in EventStatus Map variable 
+	}
+
+	@Override
+	public void sendEventStatus(String simulationId, String replyDestination){
+		//TODO: Get events for simulationId from TestContext Map variable 
+		//TODO : Check and Send events status from EventStatus Map variable 
+	}
+	
+	@Override
+	public void compareSimulations(String simulationIdOne, String simulationIdTwo){
+		
+		HistoricalComparison hc = new HistoricalComparison(dataManger);
+		//TODO: Remove expected results from this method
+		TestResultSeries testResultsSeries = null; //hc.test_proven(simulationIdTwo, expectedResultObject);
+		client.publish(testOutputTopic+simulationIdOne, testResultsSeries);
+		for (String key : testResultsSeries.results.keySet()) {
+			client.publish(testOutputTopic+simulationIdOne, "Index: " + key + " TestManager number of conflicts: "
+					+ " total " + testResultsSeries.getTotal());
+		}
+	}
+	
+	@Override
+	public void compareWithExpectedSimOutput(String simulationId, JsonObject expectedResults) {
+		client.subscribe("/topic/" + GridAppsDConstants.topic_simulationOutput + "." + simulationId,
+
+		new GossResponseEvent() {
+			public void onMessage(Serializable message) {
 				
-//			jsonReader.beginObject();
-//			while (jsonReader.hasNext()) {
-//
-//				String name = jsonReader.nextName();
-//				System.out.println(name);
-//				System.out.println(jsonReader.nextString());
-//				if (name.equals("test_configuration")) {
-//	//				readApp(jsonReader);
-//	
-//				}
-//			}
-//			jsonReader.endObject();
-			jsonReader.close();
-		} catch (Exception e) {
-			// TODO Auto-generated catch block
-//			e.printStackTrace();
-			logMessageObj.setTimestamp(new Date().getTime());
-			logMessageObj.setLogMessage("Error" + e.getMessage());
-			logManager.log(logMessageObj,GridAppsDConstants.username,null);
-		}
-		return testConfig;
-	}
-	
-	public TestScript loadTestScript(String path){
-		LogMessage logMessageObj = createLogMessage();
-		logMessageObj.setLogMessage("Loading TestScript from:" + path);
-		logManager.log(logMessageObj,GridAppsDConstants.username,null);
-		Gson gson = new GsonBuilder().setDateFormat("yyyy-MM-dd HH:mm:ss").create();
-		JsonReader jsonReader;
-		TestScript testScript = null;
-		try {
-			jsonReader = new JsonReader(new FileReader(path));
-			jsonReader.setLenient(true);
-			testScript = gson.fromJson(new FileReader(path), TestScript.class);
-//			System.out.println(testScript.toString());
-			jsonReader.close();
-		} catch (Exception e) {
-			e.printStackTrace();
-			logMessageObj.setTimestamp(new Date().getTime());
-			logMessageObj.setLogMessage("Error" + e.getMessage());
-			logManager.log(logMessageObj,GridAppsDConstants.username,null);
-		}
-		return testScript;
-	}
+				DataResponse event = (DataResponse) message;
+				String simOutputStr = event.getData().toString();
+//				if (simOutputStr.length() >= 200)
+//					simOutputStr = simOutputStr.substring(0, 200);
+				//TODO: Log debug - "TestManager received message: " + simOutput + " on topic " + event.getDestination()
+				
+				CompareResults compareResults = new CompareResults();
+				JsonObject simOutputJsonObj = CompareResults.getSimulationJson(simOutputStr);
 
-	public void requestSimulation(Client client, TestConfiguration testConfiguration, TestScript ts) throws JMSException {
-		//TODO: Request Simulation
-			//TODO: 1 PowerSystemConfig
-			//TODO: 2 SimulationConfig simulation_config
-			//TODO: 3 Build/Set ApplicationConfig 
-		//Create Request Simulation object, you could also just pass in a json string with the configuration
-		PowerSystemConfig powerSystemConfig = new PowerSystemConfig();
-		powerSystemConfig.GeographicalRegion_name = "ieee8500_Region";
-		powerSystemConfig.SubGeographicalRegion_name = "ieee8500_SubRegion";
-		powerSystemConfig.Line_name = "ieee8500";
+				if ( ! simOutputJsonObj.has("message")) {
+					//TODO: Log error - "TestManager received empty message key in simulation output"
+					return;
+				}
+				
+				String simulationTimestamp = simOutputJsonObj.getAsJsonObject().get("message").getAsJsonObject().get("timestamp").getAsString();
+				TestResults testResults = compareResults.compareExpectedWithSimulationOutput(simulationTimestamp,
+						simOutputJsonObj, expectedResults);
+				if (testResults != null) {
+					client.publish(testOutputTopic+simulationId, testResults);
+					//TODO: Store results in timeseries store.
+				}
+								
+			}
 
-		SimulationConfig simulationConfig = new SimulationConfig();
-		simulationConfig.duration = 60;
-		simulationConfig.power_flow_solver_method = "";
-		simulationConfig.simulation_id = ""; //.setSimulation_name("");
-		simulationConfig.simulator = ""; //.setSimulator("");
-
-		SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-		simulationConfig.start_time = sdf.format(new Date()); //.setStart_time("");
-
-		RequestSimulation requestSimulation = new RequestSimulation(powerSystemConfig, simulationConfig);
-
-		Gson  gson = new Gson();
-		String request = gson.toJson(requestSimulation);
-		//Step3: Send configuration to the request simulation topic
-		log.debug("Request simulation");
-		log.debug("Client is:" + client);
-		Serializable simulationId = client.getResponse(request, GridAppsDConstants.topic_requestSimulation, RESPONSE_FORMAT.JSON);
-		log.debug("simulation id is: "+simulationId);
-		//Subscribe to bridge output
-		client.subscribe("goss/gridappsd/fncs/output", new GossResponseEvent() {
-		    public void onMessage(Serializable response) {
-		      log.debug("simulation output is: "+response);
-		      System.out.println("simulation output is: "+response);
-		      //TODO capture stream and save
-		      
-		    }
 		});
 	}
 	
-	private void requestSimOld(Client client, Serializable message, DataResponse event) {
-//		statusReporter.reportStatus(String.format("Got new message in %s", getClass().getName()));
-		//TODO: create registry mapping between request topics and request handlers.
-		switch(event.getDestination().replace("/queue/", "")){
-			case topic_requestTest : {
-				log.debug("Received test request: "+ event.getData());
-				
-				//generate simulation id and reply to event's reply destination.
-//				int simulationId = generateSimulationId();
-				int testId = 1234;
-				client.publish(event.getReplyDestination(), testId);
-				try{
-					// TODO: validate simulation request json and create PowerSystemConfig and SimulationConfig dto objects to work with internally.
-					Gson  gson = new Gson();
-						
-					RequestSimulation config = gson.fromJson(message.toString(), RequestSimulation.class);
-					log.info("Parsed config "+config);
-					if(config==null || config.getPower_system_config()==null || config.getSimulation_config()==null){
-						throw new RuntimeException("Invalid configuration received");
-					}
-
-					//make request to configuration Manager to get power grid model file locations and names
-					log.debug("Creating simulation and power grid model files for simulation Id "+ testId);
-					File simulationFile = configurationManager.getSimulationFile(testId, config);
-					if(simulationFile==null){
-						throw new Exception("No simulation file returned for request "+config);
-					}
-						
-						
-					log.debug("Simulation and power grid model files generated for simulation Id "+ testId);
-					
-					//start simulation
-					log.debug("Starting simulation for id "+ testId);
-					simulationManager.startSimulation(testId, config.getSimulation_config(),null);
-					log.debug("Starting simulation for id "+ testId);
-						
-//								new ProcessSimulationRequest().process(event, client, configurationManager, simulationManager); break;
-				}catch (Exception e){
-					e.printStackTrace();
-					try {
-//						statusReporter.reportStatus(GridAppsDConstants.topic_simulationLog+testId, "Test Initialization error: "+e.getMessage());
-						log.error("Test Initialization error",e);
-					} catch (Exception e1) {
-						e1.printStackTrace();
-					}
-				}
+	//TODO: cross check this port with port used for FNCS
+	private int assignTestPort(String simulationId) throws Exception {
+		if (!rulePorts.containsKey(simulationId)) {
+			int tempPort = 49152 + randPort.nextInt(16384);
+			AtomicInteger tempPortObj = new AtomicInteger(tempPort);
+			while (rulePorts.containsValue(tempPortObj)) {
+				int newTempPort = 49152 + randPort.nextInt(16384);
+				tempPortObj.set(newTempPort);
 			}
-			//case GridAppsDConstants.topic_requestData : processDataRequest(); break;
-			//case GridAppsDConstants.topic_requestSimulationStatus : processSimulationStatusRequest(); break;
+			rulePorts.put(simulationId, tempPortObj);
+			return tempPortObj.get();
+			//TODO: test host:port is available
+		} else {
+			throw new Exception("RulePort already assigned to the simulation id : "+simulationId);
+		}
+	}
+
+	private void forwardSimInputToRuleEngine(Client client, String simulationID, int rulePort) {
+		client.subscribe("/topic/" + GridAppsDConstants.topic_simulationInput +"."+ simulationID, new GossResponseEvent(){
+			public void onMessage(Serializable message) {
+				JsonObject jsonObject = CompareResults.getSimulationJson(message.toString()); 
+				jsonObject = CompareResults.getSimulationJson(jsonObject.get("data").getAsString());
+				JsonObject forwardObject = jsonObject.get("input").getAsJsonObject();
+				forwardSimOutputToRuleEngine(forwardObject,rulePort,"output","localhost");
+			}
+		});
+	}
+	
+	private void forwardSimOutputToRuleEngine(JsonObject jsonObject, int port, String topic, String host) {
+		CloseableHttpClient httpClient = HttpClientBuilder.create().build();
+		try {
+			
+		    HttpPost request = new HttpPost("http://"+host+":"+port+"/"+topic+"/events");
+			StringEntity params = new StringEntity(jsonObject.toString());
+		    request.addHeader(HTTP.CONTENT_TYPE, "application/json");
+		    request.addHeader("Accept","application/json");
+		    request.setEntity(params);
+		    CloseableHttpResponse response = httpClient.execute(request);	    
+            /*Checking response */
+            if (response != null) {
+                InputStream in = response.getEntity().getContent(); //Get the data in the entity
+            }
+
+		} catch (Exception ex) {
+		    //TODO: Log error - handle exception here
+		} finally {
+		    try {
+				httpClient.close();
+			} catch (IOException e1) {
+				e1.printStackTrace();
+			}
 		}
 	}
 	
-	
-	public static void main(String[] args) {
-		TestManagerImpl tm = new TestManagerImpl();
-		String path = "/Users/jsimpson/git/adms/GOSS-GridAPPS-D/gov.pnnl.goss.gridappsd/applications/python/exampleTestConfig.json";
-		TestConfiguration testConf = tm.loadTestConfig(path);
-		path = "/Users/jsimpson/git/adms/GOSS-GridAPPS-D/gov.pnnl.goss.gridappsd/applications/python/exampleTestScript.json";
-		TestScript testScript = tm.loadTestScript(path);
+	/**
+	 * This method comapred simulation output with more complex rules 
+	 * using a rule engine. This is still in test mode will be available
+	 * in later release. 
+	 */
+	public void comapareSimOutputWithAppRules(String simulationId, String simulationDir, String appId, List<RuleSettings> rules) {
 		
-//		Credentials credentials = new UsernamePasswordCredentials(
-//				GridAppsDConstants.username, GridAppsDConstants.password);
-//		Client client = clientFactory.create(PROTOCOL.STOMP,credentials);
-//		
-//		
-//		requestSimulation(client, testConf, testScript);
-//		
+		
+		
+		Process rulesProcess=null;
+			try {
+				int rulePort = assignTestPort(simulationId);
+				String appRuleName = rules.get(0).name;
+				//TODO: Log info - "Calling python "+appDirectory+File.separator+appRuleName+" "+simulationID
+				ProcessBuilder ruleAppBuilder = new ProcessBuilder("python", simulationDir+File.separator+appRuleName,"-t","input","-p",""+rulePort,"--id", ""+simulationId);
+				ruleAppBuilder.redirectErrorStream(true);
+				ruleAppBuilder.redirectOutput(new File(simulationDir+File.separator+"rule_app.log"));
+				rulesProcess = ruleAppBuilder.start();
+				//TODO: Add this ruleProcess to simulationContext so it can be stopped when simulation stops 
+				try {
+					Thread.sleep(500);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+				if ( ! rulesProcess.isAlive()){
+					//TODO: log error - "Process " + appDirectory+File.separator+appRuleName+" " +"did not start check rule script and that redis is running."
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+			// Watch the process
+			if(rulesProcess!=null)
+				watch(rulesProcess, "RulesApp"+simulationId);
 	}
+	
+	private void watch(final Process process, String processName) {
+		new Thread() {
+	        public void run() {
+	            BufferedReader input = new BufferedReader(new InputStreamReader(process.getInputStream()));
+	            String line = null;
+	            try {
+	                while ((line = input.readLine()) != null) {
+	                	//TODO: debug - processName+":"+line
+	                }
+	            } catch (IOException e) {
+	            	//TODO:log error - "Error on process "+ processName, e
+	            }
+	        }
+	    }.start();
+	}
+	
 }
